@@ -6,6 +6,7 @@ from mpi4py import MPI
 import numpy as np
 import time
 import json
+import itertools
 
 from ..train.data import H5Data
 from ..utils import get_num_gpus
@@ -26,7 +27,7 @@ def get_groups(comm, num_masters=1, num_processes=1):
     groups = [sorted(g) for g in groups]
     return masters, groups, processes
     
-def get_device(comm, num_masters=1, gpu_limit=-1, gpu_for_master=False):
+def get_device(comm, num_masters=1, gpu_limit=-1, gpu_for_master=False, model_gpus=1):
     """Arguments:
         comm: MPI intracommunicator containing all processes
         num_masters: number of processes that will be assigned as masters
@@ -66,6 +67,13 @@ def get_device(comm, num_masters=1, gpu_limit=-1, gpu_for_master=False):
     for inode in range( comm.Get_size()):
         if rank == inode:
             gpu_list = get_gpu_list()
+            gpu_tuples = []
+            gpus = itertools.cycle( gpu_list )
+            while len (gpu_tuples)< len(workers_sharing_host):
+                gpu_tuples.append([])
+                while len(gpu_tuples[-1])<model_gpus:
+                    gpu_tuples[-1].append( next(gpus))
+                
             if gpu_limit>=0:
                 gpu_list = gpu_list[:gpu_limit] #limit the number of gpu
             if len(gpu_list) == 0:
@@ -74,10 +82,12 @@ def get_device(comm, num_masters=1, gpu_limit=-1, gpu_for_master=False):
             elif worker_id<0:
                 ## alone on that machine
                 print ("Alone on the node and taking the last gpu")
-                dev = 'gpu%d' % (gpu_list[-1])
+                #dev = 'gpu%d' % (gpu_list[-1])
+                dev = ['gpu%d'% gpui for gpui in gpu_tuples[-1]]
             else:
                 print ("Sharing a node and taking on the gpu")
-                dev = 'gpu%d' % (gpu_list[worker_id%len(gpu_list)])
+                #dev = 'gpu%d' % (gpu_list[worker_id%len(gpu_list)])
+                dev = ['gpu%d'% gpui for gpui in gpu_tuples[worker_id]]
             print ("rank",rank,"can have",dev)
         comm.Barrier()
     return dev

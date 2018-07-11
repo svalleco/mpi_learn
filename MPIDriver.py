@@ -84,28 +84,31 @@ if __name__ == '__main__':
 
     # Theano is the default backend; use tensorflow if --tf is specified.
     # In the theano case it is necessary to specify the device before importing.
+    ngpus = 1
     device = get_device( comm, args.masters, gpu_limit=args.max_gpus,
-                gpu_for_master=args.master_gpu)
+                         gpu_for_master=args.master_gpu,
+                         model_gpus=ngpus)
     hide_device = True
+    th_devices = ','.join(filter(None,[dev.replace('gpu','cuda') if 'gpu' in dev else None for dev in device])) if type(device)==list else device.replace('gpu','cuda')
+
+    if hide_device:
+        cuda_devices = ','.join(filter(None,[dev[-1] if 'gpu' in dev else None for dev in device])) if type(device)==list else device[-1] if 'gpu' in device else ''
+        os.environ['CUDA_VISIBLE_DEVICES'] = cuda_devices
+        print ('set to device',os.environ['CUDA_VISIBLE_DEVICES'])
+        
     if args.torch:
         print("Using pytorch")
         import torch
-        if hide_device:
-            os.environ['CUDA_VISIBLE_DEVICES'] = device[-1] if 'gpu' in device else ''
-            print ('set to device',os.environ['CUDA_VISIBLE_DEVICES'])
-        else:
+        if not hide_device:
             if 'gpu' in device:
                 torch.cuda.set_device(int(device[-1]))
-        model_builder = ModelPytorch(comm, filename=args.model_json, weights=args.model_weights, gpus=1 if 'gpu' in device else 0)
+        model_builder = ModelPytorch(comm, filename=args.model_json, weights=args.model_weights, gpus=ngpus)
     else:
         if args.tf: 
             backend = 'tensorflow'
-            if hide_device:
-                os.environ['CUDA_VISIBLE_DEVICES'] = device[-1] if 'gpu' in device else ''
-                print ('set to device',os.environ['CUDA_VISIBLE_DEVICES'])
         else:
             backend = 'theano'
-            os.environ['THEANO_FLAGS'] = "profile=%s,device=%s,floatX=float32" % (args.profile,device.replace('gpu','cuda'))
+            os.environ['THEANO_FLAGS'] = "profile=%s,device=%s,floatX=float32" % (args.profile,th_devices)
         os.environ['KERAS_BACKEND'] = backend
 
         print (backend)
@@ -130,7 +133,6 @@ if __name__ == '__main__':
         else:
             model_builder = ModelFromJson( comm, args.model_json ,weights=args.model_weights)
             print ("Process {0} using device {1}".format(comm.Get_rank(),device))
-            os.environ['THEANO_FLAGS'] = "profile=%s,device=%s,floatX=float32" % (args.profile,device.replace('gpu','cuda'))
             # GPU ops need to be executed synchronously in order for profiling to make sense
         if args.profile:
             os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
