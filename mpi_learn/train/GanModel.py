@@ -20,7 +20,7 @@ import socket
 import os
 import glob
 import h5py
-
+import math
 
 import keras.backend as K
 from keras.models import Model, Sequential
@@ -113,6 +113,68 @@ def _Model(**args):
         return Model(**args)
     else:
         return Model(**args)
+
+def ecal_angle(image):
+    image = K.squeeze(image, axis=4)
+    # size of ecal
+    x_shape= K.int_shape(image)[1]
+    y_shape= K.int_shape(image)[2]
+    z_shape= K.int_shape(image)[3]
+    sumtot = K.sum(image, axis=(1, 2, 3))# sum of events
+
+    # get 1. where event sum is 0 and 0 elsewhere
+    amask = K.tf.where(K.equal(sumtot, 0.0), K.ones_like(sumtot) , K.zeros_like(sumtot))
+    masked_events = K.sum(amask) # counting zero sum events
+    
+    # ref denotes barycenter as that is our reference point
+    x_ref = K.sum(K.sum(image, axis=(2, 3)) * (K.cast(K.expand_dims(K.arange(x_shape), 0), dtype='float32') + 0.5) , axis=1)# sum for x position * x index
+    y_ref = K.sum(K.sum(image, axis=(1, 3)) * (K.cast(K.expand_dims(K.arange(y_shape), 0), dtype='float32') + 0.5), axis=1)
+    z_ref = K.sum(K.sum(image, axis=(1, 2)) * (K.cast(K.expand_dims(K.arange(z_shape), 0), dtype='float32') + 0.5), axis=1)
+    x_ref = K.tf.where(K.equal(sumtot, 0.0), K.ones_like(x_ref) , x_ref/sumtot)# return max position if sumtot=0 and divide by sumtot otherwise
+    y_ref = K.tf.where(K.equal(sumtot, 0.0), K.ones_like(y_ref) , y_ref/sumtot)
+    z_ref = K.tf.where(K.equal(sumtot, 0.0), K.ones_like(z_ref), z_ref/sumtot)
+    #reshape    
+    x_ref = K.expand_dims(x_ref, 1)
+    y_ref = K.expand_dims(y_ref, 1)
+    z_ref = K.expand_dims(z_ref, 1)
+
+    sumz = K.sum(image, axis =(1, 2)) # sum for x,y planes going along z
+
+    # Get 0 where sum along z is 0 and 1 elsewhere
+    zmask = K.tf.where(K.equal(sumz, 0.0), K.zeros_like(sumz) , K.ones_like(sumz))
+        
+    x = K.expand_dims(K.arange(x_shape), 0) # x indexes
+    x = K.cast(K.expand_dims(x, 2), dtype='float32') + 0.5
+    y = K.expand_dims(K.arange(y_shape), 0)# y indexes
+    y = K.cast(K.expand_dims(y, 2), dtype='float32') + 0.5
+  
+    #barycenter for each z position
+    x_mid = K.sum(K.sum(image, axis=2) * x, axis=1)
+    y_mid = K.sum(K.sum(image, axis=1) * y, axis=1)
+    x_mid = K.tf.where(K.equal(sumz, 0.0), K.zeros_like(sumz), x_mid/sumz) # if sum != 0 then divide by sum
+    y_mid = K.tf.where(K.equal(sumz, 0.0), K.zeros_like(sumz), y_mid/sumz) # if sum != 0 then divide by sum
+
+    #Angle Calculations
+    z = (K.cast(K.arange(z_shape), dtype='float32') + 0.5)  * K.ones_like(z_ref) # Make an array of z indexes for all events
+    zproj = K.sqrt(K.maximum((x_mid-x_ref)**2.0 + (z - z_ref)**2.0, K.epsilon()))# projection from z axis with stability check
+    m = K.tf.where(K.equal(zproj, 0.0), K.zeros_like(zproj), (y_mid-y_ref)/zproj)# to avoid divide by zero for zproj =0
+    m = K.tf.where(K.tf.less(z, z_ref),  -1 * m, m)# sign inversion
+    ang = (math.pi/2.0) - K.tf.atan(m)# angle correction
+    zmask = K.tf.where(K.equal(zproj, 0.0), K.zeros_like(zproj) , zmask)
+    ang = ang * zmask # place zero where zsum is zero
+    
+    ang = ang * z  # weighted by position
+    sumz_tot = z * zmask # removing indexes with 0 energies or angles
+
+    #zunmasked = K.sum(zmask, axis=1) # used for simple mean 
+    #ang = K.sum(ang, axis=1)/zunmasked # Mean does not include positions where zsum=0
+
+    ang = K.sum(ang, axis=1)/K.sum(sumz_tot, axis=1) # sum ( measured * weights)/sum(weights)
+    ang = K.tf.where(K.equal(amask, 0.), ang, 100. * K.ones_like(ang)) # Place 100 for measured angle where no energy is deposited in events
+    
+    ang = K.expand_dims(ang, 1)
+    return ang
+
 def discriminator(fixed_bn = False, discr_drop_out=0.2):
 
     image = Input(shape=( 25, 25, 25,1 ), name='image')
@@ -168,6 +230,61 @@ def discriminator(fixed_bn = False, discr_drop_out=0.2):
 
     return _Model(output=[fake, aux, ecal], input=image, name='discriminator_model')
 
+def discriminator_angle(fixed_bn = False, discr_drop_out=0.2):
+    print("Loading angle discriminator version")
+    image = Input(shape=( 51, 51, 25,1 ), name='image')
+
+    bnm=2 if fixed_bn else 0
+    f=(5,5,5)
+    x = _Conv3D(16, 5, 6,6,border_mode='same',
+               name='disc_c1')(image)
+    x = LeakyReLU()(x)
+    x = Dropout(discr_drop_out)(x)
+
+    x = ZeroPadding3D((0, 0,1))(x)
+    x = _Conv3D(8, 5, 6,6,border_mode='valid',
+               name='disc_c2'
+    )(x)
+    x = LeakyReLU()(x)
+    x = _BatchNormalization(name='disc_bn1',
+                           mode=bnm,
+    )(x)
+    x = Dropout(discr_drop_out)(x)
+
+    x = ZeroPadding3D((0, 0, 1))(x)
+    x = _Conv3D(8, 5, 6,6,border_mode='valid',
+               name='disc_c3'
+)(x)
+    x = LeakyReLU()(x)
+    x = _BatchNormalization(name='disc_bn2',
+                           #momentum = 0.00001
+                           mode=bnm,
+    )(x)
+    x = Dropout(discr_drop_out)(x)
+
+    x = _Conv3D(8, 5, 6,6,border_mode='valid',
+               name='disc_c4'
+    )(x)
+    x = LeakyReLU()(x)
+    x = _BatchNormalization(name='disc_bn3',
+                           mode=bnm,
+    )(x)
+    x = Dropout(discr_drop_out)(x)
+
+    x = AveragePooling3D((2, 2, 2))(x)
+    h = Flatten()(x)
+
+    dnn = _Model(input=image, output=h, name='dnn')
+
+    dnn_out = dnn(image)
+
+    fake = _Dense(1, activation='sigmoid', name='classification')(dnn_out)
+    aux = _Dense(1, activation='linear', name='energy')(dnn_out)
+    ang = Lambda(ecal_angle)(image)
+    ecal = Lambda(lambda x: K.sum(x, axis=(1, 2, 3)), name='sum_cell')(image)
+
+    return _Model(output=[fake, aux, ang, ecal], input=image, name='discriminator_model')
+
 def generator(latent_size=200, return_intermediate=False, with_bn=True):
 
     latent = Input(shape=(latent_size, ))
@@ -199,6 +316,50 @@ def generator(latent_size=200, return_intermediate=False, with_bn=True):
 
     x = ZeroPadding3D((1,0,3))(x)
     x = _Conv3D(6, 3, 3, 8, init='he_uniform',
+               name='gen_c3')(x)
+    x = LeakyReLU()(x)
+
+    x = _Conv3D(1, 2, 2, 2, bias=False, init='glorot_normal',
+               name='gen_c4')(x)
+    x = Activation('relu')(x)
+
+    loc = _Model(input=latent, output=x)
+    fake_image = loc(latent)
+    _Model(input=[latent], output=fake_image)
+    return _Model(input=[latent], output=fake_image, name='generator_model')
+
+def generator_angle(latent_size=200, return_intermediate=False, with_bn=True):
+    print("Loading angle generator version")
+
+    latent = Input(shape=(latent_size, ))
+
+    bnm=0
+    x = _Dense(5184, init='glorot_normal',
+              name='gen_dense1'
+    )(latent)
+    x = Reshape((9, 9,8, 8))(x)
+    x = _Conv3D(64, 6, 6, 8, border_mode='same', init='he_uniform',
+               name='gen_c1'
+    )(x)
+    x = LeakyReLU()(x)
+    if with_bn:
+        x = _BatchNormalization(name='gen_bn1',
+                           mode=bnm
+    )(x)
+    x = UpSampling3D(size=(3, 3, 2))(x)
+
+    x = ZeroPadding3D((2, 3, 1))(x)
+    x = _Conv3D(6, 5, 8, 8, init='he_uniform',
+               name='gen_c2'
+    )(x)
+    x = LeakyReLU()(x)
+    if with_bn:
+        x = _BatchNormalization(name='gen_bn2',
+                           mode=bnm)(x)
+    x = UpSampling3D(size=(2, 2, 3))(x)
+
+    x = ZeroPadding3D((0,2,0))(x)
+    x = _Conv3D(6, 3, 5, 8, init='he_uniform',
                name='gen_c3')(x)
     x = LeakyReLU()(x)
 
@@ -274,8 +435,6 @@ def generate(g, index, latent, sampled_labels):
     generated_images = g.predict(gen_in, verbose=False, batch_size=100)
     return generated_images
 
-
-
 def metric(ganvar, g4var, energies, m):
    #calculate totale absolute errors on average moments+energies 
    ecal_size = 25
@@ -345,6 +504,7 @@ class GANModel(MPIModel):
     def __init__(self, **args):#latent_size=200, checkpoint=True, gen_bn=True, onepass=False):
         self.tell = args.get('tell',True)
         self.gen_bn = args.get('gen_bn',True)
+        self.angle = args.get('angle', False)
         self._onepass = args.get('onepass',bool(int(os.environ.get('GANONEPASS',0))))
         self._reversedorder = args.get('reversedorder',bool(int(os.environ.get('GANREVERSED',0))))
         self._switchingloss = args.get('switchingloss',False)
@@ -359,6 +519,7 @@ class GANModel(MPIModel):
         self.discr_loss_weights = [
             args.get('gen_weight',2),
             args.get('aux_weight',0.1),
+            args.get('angle_weight',10),
             args.get('ecal_weight',0.1)
         ]
         
@@ -384,7 +545,6 @@ class GANModel(MPIModel):
             if self._show_values: print("showing the input values at each batch")
             if self._show_loss: print("showing the loss at each batch")
             if self._show_weights: print("showing weights statistics at each batch")
-
         MPIModel.__init__(self, models = [
             self.discriminator,
             #self.generator
@@ -473,24 +633,45 @@ class GANModel(MPIModel):
 
     def ext_assemble_models(self):
         print('[INFO] Building generator')
-        self.generator = generator(self.latent_size, with_bn = self.gen_bn)
+        if self.angle: 
+            self.generator = generator_angle(self.latent_size, with_bn = self.gen_bn)
+        else:
+            self.generator = generator(self.latent_size, with_bn = self.gen_bn)
         print('[INFO] Building discriminator')
-        self.discriminator = discriminator(discr_drop_out = self.discr_drop_out)
-        if self.with_fixed_disc:
-            self.fixed_discriminator = discriminator(discr_drop_out = self.discr_drop_out, fixed_bn=True)
+        if self.angle: 
+            self.discriminator = discriminator_angle(discr_drop_out = self.discr_drop_out)
+            if self.with_fixed_disc:
+               self.fixed_discriminator = discriminator_angle(discr_drop_out = self.discr_drop_out, fixed_bn=True)
+        else:
+            self.discriminator = discriminator(discr_drop_out = self.discr_drop_out)
+            if self.with_fixed_disc:
+               self.fixed_discriminator = discriminator(discr_drop_out = self.discr_drop_out, fixed_bn=True)
         print('[INFO] Building combined')
         latent = Input(shape=(self.latent_size, ), name='combined_z')
         fake_image = self.generator(latent)
-        if self.with_fixed_disc:
-            fake, aux, ecal = self.fixed_discriminator(fake_image)
+        if self.angle: 
+            if self.with_fixed_disc:
+               fake, aux, ang, ecal = self.fixed_discriminator(fake_image)
+            else:
+               fake, aux, ang, ecal = self.discriminator(fake_image)
         else:
-            fake, aux, ecal = self.discriminator(fake_image)
+            if self.with_fixed_disc:
+               fake, aux, ecal = self.fixed_discriminator(fake_image)
+            else:
+               fake, aux, ecal = self.discriminator(fake_image)
 
-        self.combined = Model(
-            input=[latent],
-            output=[fake, aux, ecal],
-            name='combined_model'
-        )
+        if self.angle: 
+           self.combined = Model(
+               input=[latent],
+               output=[fake, aux, ang, ecal],
+               name='combined_model'
+           )
+        else:
+           self.combined = Model(
+               input=[latent],
+               output=[fake, aux, ecal],
+               name='combined_model'
+           )
 
     def compile(self, **args):
         ## args are fully ignored here
@@ -518,23 +699,36 @@ class GANModel(MPIModel):
         self.generator.compile(
             optimizer=make_opt(**args),
             loss='binary_crossentropy') ## never  actually used for training
-
-        self.discriminator.compile(
-            optimizer=make_opt(**args),
-            loss=['binary_crossentropy', 'mean_absolute_percentage_error', 'mean_absolute_percentage_error'],
-            loss_weights=self.discr_loss_weights
-        )
+        if self.angle: 
+            self.discriminator.compile(
+               optimizer=make_opt(**args),
+               loss=['binary_crossentropy','mean_absolute_percentage_error', 'mean_absolute_percentage_error', 'mean_absolute_percentage_error'],
+               loss_weights=self.discr_loss_weights
+            )
+        else:
+            self.discriminator.compile(
+               optimizer=make_opt(**args),
+               loss=['binary_crossentropy', 'mean_absolute_percentage_error', 'mean_absolute_percentage_error'],
+               loss_weights=self.discr_loss_weights
+            )
 
         if hasattr(self,'fixed_discriminator'):
             self.fixed_discriminator.trainable = False
         else:
             self.discriminator.trainable = False
 
-        self.combined.compile(
-            optimizer=make_opt(**args),
-            loss=['binary_crossentropy', 'mean_absolute_percentage_error', 'mean_absolute_percentage_error'],
-            loss_weights=self.discr_loss_weights
-        )
+        if self.angle: 
+           self.combined.compile(
+              optimizer=make_opt(**args),
+              loss=['binary_crossentropy','mean_absolute_percentage_error', 'mean_absolute_percentage_error', 'mean_absolute_percentage_error'],
+              loss_weights=self.discr_loss_weights
+           )
+        else: 
+           self.combined.compile(
+              optimizer=make_opt(**args),
+              loss=['binary_crossentropy', 'mean_absolute_percentage_error', 'mean_absolute_percentage_error'],
+              loss_weights=self.discr_loss_weights
+           )
         self.combined.metrics_names = self.discriminator.metrics_names
         print (self.discriminator.metrics_names)
         print (self.combined.metrics_names)
@@ -562,21 +756,28 @@ class GANModel(MPIModel):
             print (hn(),"initializing sizes",x_disc_real.shape,[ yy.shape for yy in y])
 
 
-        noise = np.random.normal(0, 1, (self.batch_size, self.latent_size))
-        sampled_energies = np.random.uniform(0.1, 5,(self.batch_size,1))
-        generator_ip = np.multiply(sampled_energies, noise)
-        #if show_values: print ('energies',np.ravel(sampled_energies)[:10])
-        if show_values: mm('energies',sampled_energies)
-        ratio = np.polyval(root_fit, sampled_energies)
-        #if show_values: print ('ratios',np.ravel(ratio)[:10])
-        if show_values: mm('ratios',ratio)
-        ecal_ip = np.multiply(ratio, sampled_energies)
-        #if show_values: print ('estimated sum cells',np.ravel(ecal_ip)[:10])
+        noise = np.random.normal(0, 1, (self.batch_size, self.latent_size -1))
+        if self.angle:
+           sampled_energies = y[1].reshape(-1, 1)
+           generator_ip = np.multiply(sampled_energies, noise)
+           generator_ip = np.concatenate((y[3].reshape(-1,1), generator_ip),axis=1)
+           ecal_ip = y[2].reshape(-1, 1)
+        else:
+           sampled_energies = np.random.uniform(0.1, 5,(self.batch_size,1))
+           generator_ip = np.multiply(sampled_energies, noise)
+           #if show_values: print ('energies',np.ravel(sampled_energies)[:10])
+           if show_values: mm('energies',sampled_energies)
+           ratio = np.polyval(root_fit, sampled_energies)
+           #if show_values: print ('ratios',np.ravel(ratio)[:10])
+           if show_values: mm('ratios',ratio)
+           ecal_ip = np.multiply(ratio, sampled_energies)
+           #if show_values: print ('estimated sum cells',np.ravel(ecal_ip)[:10])
         if show_values: mm('estimated sum cells',ecal_ip)
 
         now = time.mktime(time.gmtime())
         if self.p_cc>1 and len(self.p_t)%100==0:
             print ("prediction average",np.mean(self.p_t),"[s]' over",len(self.p_t))
+        print ("generator_ip shape", generator_ip.shape) 
         generated_images = self.generator.predict(generator_ip)
         ecal_rip = np.squeeze(np.sum(generated_images, axis=(1, 2, 3)))
         #if show_values: print ('generated sum cells',np.ravel(ecal_rip)[:10])
@@ -602,8 +803,12 @@ class GANModel(MPIModel):
 
         ## need to bit flip the true labels too
         bf = bit_flip(y[0])
-        y_disc_fake = [bit_flip(np.zeros(self.batch_size)), sampled_energies.reshape((-1,)), ecal_ip.reshape((-1,))]
-        re_y = [bf, y_disc_real[1], y_disc_real[2]]
+        if self.angle:
+            y_disc_fake = [bit_flip(np.zeros(self.batch_size)), sampled_energies.reshape((-1,)), y_disc_real[3].reshape((-1,)), ecal_ip.reshape((-1,))]
+            re_y = [bf, y_disc_real[1], y_disc_real[3], y_disc_real[2]]
+        else:
+            y_disc_fake = [bit_flip(np.zeros(self.batch_size)), sampled_energies.reshape((-1,)), ecal_ip.reshape((-1,))]
+            re_y = [bf, y_disc_real[1], y_disc_real[2]]
 
         if self._onepass:
             ## train the discriminator in one go
@@ -617,22 +822,34 @@ class GANModel(MPIModel):
             np.random.shuffle( bb_y[1] )
             np.random.set_state(rng_state)
             np.random.shuffle( bb_y[2] )
+            np.random.set_state(rng_state)
+            np.random.shuffle( bb_y[3] )
 
             X_for_disc = bb_x
             Y_for_disc = bb_y
 
 
 
-        c_noise = np.random.normal(0, 1, (2*self.batch_size, self.latent_size))
+        c_noise = np.random.normal(0, 1, (self.batch_size, self.latent_size-1))
         ###print ('noise',np.ravel(noise)[:10])
-        c_sampled_energies = np.random.uniform(0.1, 5, (2*self.batch_size,1 ))
-        c_generator_ip = np.multiply(c_sampled_energies, c_noise)
-        c_ratio = np.polyval(root_fit, c_sampled_energies)
-        c_ecal_ip = np.multiply(c_ratio, c_sampled_energies)
+        if self.angle:
+           c_sampled_energies = y[1].reshape(-1, 1)
+           c_generator_ip = np.multiply(c_sampled_energies, c_noise)
+           c_generator_ip = np.concatenate((y[3].reshape(-1, 1), c_generator_ip), axis=1)
+           c_ecal_ip = y[2].reshape(-1, 1)
+        else:
+           c_sampled_energies = np.random.uniform(0.1, 5, (2*self.batch_size,1 ))
+           c_generator_ip = np.multiply(c_sampled_energies, c_noise)
+           c_ratio = np.polyval(root_fit, c_sampled_energies)
+           c_ecal_ip = np.multiply(c_ratio, c_sampled_energies)
+           
         c_trick = np.ones(2*self.batch_size)
 
         X_for_combined = [c_generator_ip]
-        Y_for_combined = [c_trick,c_sampled_energies.reshape((-1, 1)), c_ecal_ip]
+        if self.angle:
+           Y_for_combined = [c_trick,c_sampled_energies.reshape((-1, 1)), y[3].reshape((-1, 1)), c_ecal_ip]
+        else:
+           Y_for_combined = [c_trick,c_sampled_energies.reshape((-1, 1)), c_ecal_ip]
 
         if self._onepass:
             return (X_for_disc,Y_for_disc,X_for_combined,Y_for_combined)
